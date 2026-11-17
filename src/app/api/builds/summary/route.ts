@@ -6,14 +6,13 @@ import {
   resolveGroupsToJobConditions,
 } from "@/lib/test-groups";
 import { SHARD_SUFFIX_SQL } from "@/lib/job-shards";
-import {
-  ensureTestAreaMapping,
-  getTestAreaMappingForCommit,
-} from "@/lib/test-areas";
+import type { TestAreaMapping } from "@/lib/test-areas";
+import { getGroupFilterMapping } from "@/lib/repository-test-groups";
 import { getCached, setCache } from "@/lib/api-cache";
 import { resolveCiDataSource } from "@/lib/ci-data-source";
 import { enrichBuildAuthors } from "@/lib/github-build-authors";
-import { queryBuildJobsFromOtel, queryBuildsFromOtel } from "@/lib/otel-ci";
+import { queryBuildsFromOtel } from "@/lib/otel-ci";
+import { getBuildGroupJobs, groupBuildJobs } from "@/lib/build-group-jobs";
 
 const MAX_PER_PAGE = 30;
 const DEFAULT_PER_PAGE = 10;
@@ -53,6 +52,7 @@ function buildJobFilterSubquery(
   jobNames: string[],
   buildWhere: string,
   params: QueryParams,
+  mapping?: TestAreaMapping,
 ): string {
   const nameConditions: string[] = [];
   // Match a runtime-sharded step by its shards too (see job-shards.ts).
@@ -64,7 +64,7 @@ function buildJobFilterSubquery(
   }
 
   if (jobGroups.length > 0) {
-    const { exactNames, regexPatterns } = resolveGroupsToJobConditions(jobGroups);
+    const { exactNames, regexPatterns, queuePatterns } = resolveGroupsToJobConditions(jobGroups, mapping);
     if (exactNames.length > 0) {
       params.groupJobNames = exactNames;
       nameConditions.push(`${step} IN {groupJobNames:Array(String)}`);
@@ -72,9 +72,16 @@ function buildJobFilterSubquery(
     regexPatterns.forEach((pattern, index) => {
       nameConditions.push(regexCondition(step, pattern, `jobRegex${index}`, params));
     });
+    queuePatterns.forEach(({ pattern, queue }, index) => {
+      params[`groupQueue${index}`] = `queue=${queue}`;
+      nameConditions.push(`(${regexCondition(step, pattern, `queueRegex${index}`, params)} AND jf.id IN (
+        SELECT build_job_id FROM buildkite.build_job_agent_query_rule FINAL
+        WHERE NOT _fivetran_deleted AND rule = {groupQueue${index}:String}
+      ))`);
+    });
   }
 
-  if (nameConditions.length === 0) return "";
+  if (nameConditions.length === 0) return jobGroups.length ? "AND 0" : "";
 
   return `AND b.id IN (
     SELECT DISTINCT jf.build_id
@@ -143,12 +150,6 @@ interface BuildRow {
   author: string | null;
   pr_number: string | null;
   duration_mins: string | null;
-}
-
-interface JobRow {
-  build_id: string;
-  name: string;
-  state: string;
 }
 
 function stateIcon(state: string): string {
@@ -290,7 +291,6 @@ export async function GET(request: NextRequest) {
     }
 
     if (resolveCiDataSource(request) === "otel") {
-      await ensureTestAreaMapping();
       const { builds, summary: summaryData, total } = await queryBuildsFromOtel({
         pipeline,
         branch,
@@ -304,7 +304,8 @@ export async function GET(request: NextRequest) {
       });
 
       const buildIds = builds.map((b) => b.id as string);
-      const jobRows = await queryBuildJobsFromOtel(buildIds);
+      const jobRows = buildIds.length ? await getBuildGroupJobs(buildIds, "otel") : [];
+      const grouped = await groupBuildJobs(jobRows, buildIds);
       const jobsByBuild = new Map<string, { name: string; state: string }[]>();
       for (const j of jobRows) {
         const buildId = j.build_id as string;
@@ -314,7 +315,7 @@ export async function GET(request: NextRequest) {
 
       const buildsWithGroups = builds.map((b) => {
         const buildJobs = jobsByBuild.get(b.id as string) ?? [];
-        const testGroups = aggregateJobsByGroup(buildJobs);
+        const testGroups = grouped.get(b.id as string)?.groups ?? [];
         const matchedJobs = jobNames.length > 0
           ? foldRuntimeShards(buildJobs).filter((j) => jobNames.includes(j.name))
           : undefined;
@@ -373,8 +374,8 @@ export async function GET(request: NextRequest) {
 
     const params: QueryParams = {};
     const where = buildWhereClause({ pipeline, branch, startDate, endDate, state }, params);
-    await ensureTestAreaMapping();
-    const jobFilter = buildJobFilterSubquery(jobGroups, jobNames, where, params);
+    const mapping = jobGroups.length ? await getGroupFilterMapping(pipeline) : undefined;
+    const jobFilter = buildJobFilterSubquery(jobGroups, jobNames, where, params, mapping);
     const pipelineJoin = `INNER JOIN (
           SELECT id, name FROM buildkite.pipeline FINAL WHERE NOT _fivetran_deleted
         ) AS p ON b.pipeline_id = p.id`;
@@ -419,44 +420,17 @@ export async function GET(request: NextRequest) {
     const buildIds = enrichedBuilds.map((b) => b.id);
     const jobsByBuild = new Map<string, { name: string; state: string }[]>();
 
-    if (buildIds.length > 0) {
-      const jobs = await queryClickHouse<JobRow>(`
-        SELECT
-          j.build_id AS build_id,
-          j.name AS name,
-          j.state AS state
-        FROM buildkite.build_job AS j FINAL
-        WHERE j.build_id IN {buildIds:Array(String)}
-          AND NOT j._fivetran_deleted
-          AND j.type = 'script'
-          AND j.name IS NOT NULL
-      `, { buildIds });
-
-      for (const j of jobs) {
-        if (!jobsByBuild.has(j.build_id)) jobsByBuild.set(j.build_id, []);
-        jobsByBuild.get(j.build_id)!.push({ name: j.name, state: j.state });
-      }
+    const jobRows = buildIds.length ? await getBuildGroupJobs(buildIds, "clickhouse") : [];
+    const grouped = await groupBuildJobs(jobRows, buildIds);
+    for (const j of jobRows) {
+      const id = j.build_id as string;
+      if (!jobsByBuild.has(id)) jobsByBuild.set(id, []);
+      jobsByBuild.get(id)!.push({ name: j.name as string, state: j.state as string });
     }
 
-    const mappingsByCommit = new Map<
-      string,
-      ReturnType<typeof getTestAreaMappingForCommit>
-    >();
-    for (const build of enrichedBuilds) {
-      const mappingKey = `${build.branch}:${build.commit_sha}`;
-      if (!mappingsByCommit.has(mappingKey)) {
-        mappingsByCommit.set(
-          mappingKey,
-          getTestAreaMappingForCommit(build.commit_sha, build.branch),
-        );
-      }
-    }
     const buildsWithGroups = await Promise.all(enrichedBuilds.map(async (b) => {
       const buildJobs = jobsByBuild.get(b.id) ?? [];
-      const mapping = await mappingsByCommit.get(
-        `${b.branch}:${b.commit_sha}`,
-      )!;
-      const testGroups = aggregateJobsByGroup(buildJobs, mapping);
+      const testGroups = grouped.get(b.id)?.groups ?? [];
       let prNumber = b.pr_number;
       if (!prNumber && b.message) {
         const match = b.message.match(/\(#(\d+)\)/);

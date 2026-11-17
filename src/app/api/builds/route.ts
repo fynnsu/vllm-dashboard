@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { queryClickHouse, type ClickHouseParam } from "@/lib/clickhouse";
 import { resolveGroupsToJobConditions } from "@/lib/test-groups";
-import { ensureTestAreaMapping } from "@/lib/test-areas";
+import type { TestAreaMapping } from "@/lib/test-areas";
+import { getGroupFilterMapping } from "@/lib/repository-test-groups";
 import { getCached, setCache } from "@/lib/api-cache";
 import { cachedJson } from "@/lib/api-response";
 import { resolveCiDataSource } from "@/lib/ci-data-source";
@@ -66,6 +67,7 @@ function buildJobFilterSubquery(
   jobNames: string[],
   buildWhere: string,
   params: QueryParams,
+  mapping?: TestAreaMapping,
 ): string {
   const nameConditions: string[] = [];
   // Match a runtime-sharded step by its shards too (see job-shards.ts).
@@ -77,7 +79,7 @@ function buildJobFilterSubquery(
   }
 
   if (jobGroups.length > 0) {
-    const { exactNames, regexPatterns } = resolveGroupsToJobConditions(jobGroups);
+    const { exactNames, regexPatterns, queuePatterns } = resolveGroupsToJobConditions(jobGroups, mapping);
     if (exactNames.length > 0) {
       params.groupJobNames = exactNames;
       nameConditions.push(`${step} IN {groupJobNames:Array(String)}`);
@@ -85,9 +87,16 @@ function buildJobFilterSubquery(
     regexPatterns.forEach((pattern, index) => {
       nameConditions.push(regexCondition(step, pattern, `jobRegex${index}`, params));
     });
+    queuePatterns.forEach(({ pattern, queue }, index) => {
+      params[`groupQueue${index}`] = `queue=${queue}`;
+      nameConditions.push(`(${regexCondition(step, pattern, `queueRegex${index}`, params)} AND jf.id IN (
+        SELECT build_job_id FROM buildkite.build_job_agent_query_rule FINAL
+        WHERE NOT _fivetran_deleted AND rule = {groupQueue${index}:String}
+      ))`);
+    });
   }
 
-  if (nameConditions.length === 0) return "";
+  if (nameConditions.length === 0) return jobGroups.length ? "AND 0" : "";
 
   return `AND b.id IN (
     SELECT DISTINCT jf.build_id
@@ -156,9 +165,6 @@ export async function GET(request: NextRequest) {
     if (cached) return cachedJson(cached, CDN_CACHE);
 
     if (resolveCiDataSource(request) === "otel") {
-      if (jobGroups.length > 0) {
-        await ensureTestAreaMapping();
-      }
       const { builds, buildDurations, summary, total } = await queryBuildsFromOtel({
         pipeline,
         branch,
@@ -182,10 +188,8 @@ export async function GET(request: NextRequest) {
 
     const params: QueryParams = {};
     const where = buildWhereClause({ pipeline, branch, startDate, endDate }, params);
-    if (jobGroups.length > 0) {
-      await ensureTestAreaMapping();
-    }
-    const jobFilter = buildJobFilterSubquery(jobGroups, jobNames, where, params);
+    const mapping = jobGroups.length ? await getGroupFilterMapping(pipeline) : undefined;
+    const jobFilter = buildJobFilterSubquery(jobGroups, jobNames, where, params, mapping);
     const pipelineJoin = `INNER JOIN (
           SELECT id, name FROM buildkite.pipeline FINAL WHERE NOT _fivetran_deleted
         ) AS p ON b.pipeline_id = p.id`;

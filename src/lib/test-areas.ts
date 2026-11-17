@@ -26,8 +26,10 @@ export interface TestArea {
 
 export interface TestAreaMapping {
   jobToGroup: Map<string, string>;
-  patterns: { regex: RegExp; group: string }[];
+  patterns: { regex: RegExp; group: string; queue?: string; optional?: boolean; softFail?: boolean }[];
   groups: string[];
+  /** Disable vLLM-only name heuristics for other repositories. */
+  vllmFallbacks?: boolean;
 }
 
 /** Matches job names belonging to steps that carry a given YAML flag. */

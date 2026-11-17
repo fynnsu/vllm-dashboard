@@ -20,6 +20,15 @@ in the URL and carried across dashboard tabs: `/?pipeline=speculators` and
 defaults to `CI`; `?pipeline=` selects all pipelines. Other views retain the
 selection for navigation and identify their shared-infrastructure or vLLM scope.
 
+Build groups use the pipeline's repository configuration. Speculators groups
+are discovered from its `.buildkite/**/*.yml` and `.yaml` files at each build's
+commit, including development, smoke, and nightly groups. Matrix labels and
+agent queues distinguish jobs with identical names on different GPU runners.
+If commit configuration is unavailable, discovery falls back to that repository's
+`main` configuration. vLLM pipelines keep their existing test-area mappings.
+Additional repositories can be registered in `src/lib/repository-test-groups.ts`.
+An optional `GITHUB_TOKEN` raises the GitHub API rate limit for group discovery.
+
 - **Builds** — pass/fail rates, durations, and per-job breakdowns for recent pipeline builds.
 - **Jobs** — job failures, historical run times, and retry counts by job,
   with pipeline, branch, and time-range filtering. See [retry counting](./docs/jobs-retries.md).

@@ -5,6 +5,7 @@ export interface BuildJobRosterEntry {
   state: string;
   web_url?: string;
   started_at: string | null;
+  queue?: string;
 }
 
 export interface BuildJobRoster {
@@ -70,6 +71,8 @@ export async function getBuildJobRosterRows(
         started_at: job.started_at,
         commit_sha: roster.commit,
         branch: roster.branch,
+        pipeline_slug: build.pipeline,
+        queue: job.queue,
       });
     }
   }
@@ -180,6 +183,7 @@ async function fetchBuildJobRoster(
       type?: string;
       web_url?: string;
       started_at?: string | null;
+      agent_query_rules?: string[];
     }>;
   };
 
@@ -190,6 +194,8 @@ async function fetchBuildJobRoster(
       state: normalizeJobState(job.state),
       web_url: job.web_url,
       started_at: job.started_at ?? null,
+      ...(job.agent_query_rules?.find((rule) => rule.startsWith("queue="))
+        ? { queue: job.agent_query_rules.find((rule) => rule.startsWith("queue="))!.slice(6) } : {}),
     }));
 
   return { jobs, commit: build.commit ?? null, branch: build.branch ?? null, state: build.state ?? null };

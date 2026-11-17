@@ -2,6 +2,7 @@ import { queryClickHouse, type ClickHouseParam } from "@/lib/clickhouse";
 import { attrText, DEDUPE_SPANS, toNullableNumber, toNumber } from "@/lib/otel-clickhouse";
 import { enrichBuildAuthors } from "@/lib/github-build-authors";
 import { resolveGroupsToJobConditions } from "@/lib/test-groups";
+import { getGroupFilterMapping } from "@/lib/repository-test-groups";
 import type { ServerTiming } from "@/lib/server-timing";
 import { SHARD_SUFFIX_SQL, SHARD_TOTAL_SQL } from "@/lib/job-shards";
 
@@ -149,22 +150,26 @@ function regexCondition(p: Params, expr: string, pattern: string): string {
  * Restricts build spans to builds that ran a matching script job, the
  * equivalent of the Databricks job-group/name filter subquery.
  */
-function jobFilterClause(p: Params, f: CiFilter, jobGroups: string[], jobNames: string[]): string | null {
+async function jobFilterClause(p: Params, f: CiFilter, jobGroups: string[], jobNames: string[]): Promise<string | null> {
   const conditions: string[] = [];
   // Match a runtime-sharded step by its shards too (see job-shards.ts).
   if (jobNames.length > 0) {
     conditions.push(`${STEP_NAME} IN ${p.bind(jobNames, "Array(String)")}`);
   }
   if (jobGroups.length > 0) {
-    const { exactNames, regexPatterns } = resolveGroupsToJobConditions(jobGroups);
+    const mapping = await getGroupFilterMapping(f.pipeline);
+    const { exactNames, regexPatterns, queuePatterns } = resolveGroupsToJobConditions(jobGroups, mapping);
     if (exactNames.length > 0) {
       conditions.push(`${STEP_NAME} IN ${p.bind(exactNames, "Array(String)")}`);
     }
     for (const pattern of regexPatterns) conditions.push(regexCondition(p, STEP_NAME, pattern));
+    for (const { pattern, queue } of queuePatterns) {
+      conditions.push(`(${regexCondition(p, STEP_NAME, pattern)} AND j.agent_queue = ${p.bind(queue, "String")})`);
+    }
   }
-  if (conditions.length === 0) return null;
+  if (conditions.length === 0) return jobGroups.length ? "0" : null;
 
-  const jobs = spans("pipeline_slug, build_number, job_label, job_state", [
+  const jobs = spans("pipeline_slug, build_number, job_label, job_state, agent_queue", [
     "span_name = 'buildkite.job'",
     "job_label IS NOT NULL",
     "job_type = 'script'",
@@ -197,7 +202,7 @@ export async function queryBuildsFromOtel(
   const p = new Params();
   const where = ["span_name = 'buildkite.build'", ...spanFilters(p, f)];
   if (f.branch) where.push(`build_branch = ${p.bind(f.branch, "String")}`);
-  const jobFilter = jobFilterClause(p, f, f.jobGroups, f.jobNames);
+  const jobFilter = await jobFilterClause(p, f, f.jobGroups, f.jobNames);
   if (jobFilter) where.push(jobFilter);
   // State can change between a span's versions, so test it after dedupe.
   const state = f.state ? `WHERE build_state = ${p.bind(f.state, "String")}` : "";
@@ -299,7 +304,7 @@ export async function queryBuildJobsFromOtel(buildIds: string[]) {
   if (keys.length === 0) return [] as Record<string, unknown>[];
 
   const p = new Params();
-  const jobs = spans("pipeline_slug, build_number, job_label, job_state, job_passed, start_time, span_attributes", [
+  const jobs = spans("pipeline_slug, build_number, job_label, job_state, job_passed, start_time, span_attributes, agent_queue", [
     "span_name = 'buildkite.job'",
     `pipeline_slug IN ${p.bind([...new Set(keys.map((k) => k.slug))], "Array(String)")}`,
     `build_number IN ${p.bind([...new Set(keys.map((k) => k.num))], "Array(Int64)")}`,
@@ -313,6 +318,8 @@ export async function queryBuildJobsFromOtel(buildIds: string[]) {
       ${JOB_STATE_LABEL} AS state,
       ${attrText("buildkite.job.web_url", "j.span_attributes")} AS web_url,
       j.start_time AS started_at,
+      j.pipeline_slug AS pipeline_slug,
+      j.agent_queue AS queue,
       ${attrText("buildkite.build.commit", "j.span_attributes")} AS commit_sha,
       ${attrText("buildkite.build.branch", "j.span_attributes")} AS branch
     FROM ${jobs} AS j

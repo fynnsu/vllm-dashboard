@@ -9,23 +9,27 @@ function stripDevicePrefix(jobName: string): string | null {
   return match ? match[1] : null;
 }
 
-function resolveGroup(jobName: string, mapping: TestAreaMapping): string | null {
+function resolveGroup(jobName: string, mapping: TestAreaMapping, queue?: string): string | null {
   // Direct match from yaml labels
   const direct = mapping.jobToGroup.get(jobName);
   if (direct) return direct;
 
   // Pattern match for parallelized jobs (label contains %N → "Kernels MoE Test 1", etc.)
-  for (const { regex, group } of mapping.patterns) {
-    if (regex.test(jobName)) return group;
+  if (mapping.vllmFallbacks !== false) {
+    return mapping.patterns.find((rule) => rule.regex.test(jobName))?.group ?? null;
   }
-
-  return null;
+  const groups = new Set(mapping.patterns
+    .filter((rule) => rule.regex.test(jobName) && (!queue || !rule.queue || rule.queue === queue))
+    .map((rule) => rule.group));
+  // Without a queue, an ambiguous label must not be assigned to an arbitrary GPU group.
+  return groups.size === 1 ? [...groups][0] : null;
 }
 
-export function getTestGroup(jobName: string, mapping: TestAreaMapping): string | null {
+export function getTestGroup(jobName: string, mapping: TestAreaMapping, queue?: string): string | null {
   // Direct match or pattern match
-  const group = resolveGroup(jobName, mapping);
+  const group = resolveGroup(jobName, mapping, queue);
   if (group) return group;
+  if (mapping.vllmFallbacks === false) return null;
 
   // AMD CI pipeline jobs with device prefix (mi250_1:, mi325_1:, mi355_1:, etc.)
   const stripped = stripDevicePrefix(jobName);
@@ -183,6 +187,7 @@ export interface JobInfo {
   name: string;
   state: string;
   web_url?: string;
+  queue?: string;
   /** A runtime-sharded step's shards, by index; the step's state is all of theirs. */
   shards?: ShardInfo[];
 }
@@ -207,30 +212,35 @@ export function isFailedJobState(state: string): boolean {
   );
 }
 
-export function resolveGroupsToJobConditions(groups: string[]): { exactNames: string[]; regexPatterns: string[] } {
-  const mapping = getTestAreaMapping();
+export function resolveGroupsToJobConditions(groups: string[], mapping = getTestAreaMapping()): {
+  exactNames: string[];
+  regexPatterns: string[];
+  queuePatterns: { pattern: string; queue: string }[];
+} {
   const exactNames: string[] = [];
   const regexPatterns: string[] = [];
+  const queuePatterns: { pattern: string; queue: string }[] = [];
   const groupSet = new Set(groups);
 
   for (const [name, group] of mapping.jobToGroup) {
     if (groupSet.has(group)) exactNames.push(name);
   }
 
-  for (const { regex, group } of mapping.patterns) {
+  for (const { regex, group, queue } of mapping.patterns) {
     if (groupSet.has(group)) {
-      regexPatterns.push(regex.source);
+      if (queue) queuePatterns.push({ pattern: regex.source, queue });
+      else regexPatterns.push(regex.source);
     }
   }
 
-  if (groupSet.has("Hardware-AMD Tests")) {
+  if (mapping.vllmFallbacks !== false && groupSet.has("Hardware-AMD Tests")) {
     regexPatterns.push("^mi\\d+[A-Z]?_\\d+:.*$");
     // AMD image preparation is its own Buildkite group.
     regexPatterns.push("^AMD: (?!:docker: ).*$");
     regexPatterns.push("^:amd: .*$");
   }
 
-  return { exactNames, regexPatterns };
+  return { exactNames, regexPatterns, queuePatterns };
 }
 
 /** Summarize one group's jobs into counts and an overall group state. */
@@ -300,6 +310,7 @@ export function foldRuntimeShards(jobs: JobInfo[]): JobInfo[] {
       name: job.name,
       state: failing ? "failed" : representative.state,
       web_url: (failing ?? shards[0]).web_url,
+      ...(representative.queue ? { queue: representative.queue } : {}),
       shards: shards.map((shard) => ({
         ...runtimeShard(shard.name)!,
         state: shard.state,
@@ -310,13 +321,13 @@ export function foldRuntimeShards(jobs: JobInfo[]): JobInfo[] {
 }
 
 export function aggregateJobsByGroup(
-  jobs: { name: string; state: string; web_url?: string }[],
+  jobs: JobInfo[],
   mapping: TestAreaMapping = getTestAreaMapping(),
 ): GroupStatus[] {
   const groupMap = new Map<string, JobInfo[]>();
 
   for (const job of foldRuntimeShards(jobs)) {
-    const group = getTestGroup(job.name, mapping);
+    const group = getTestGroup(job.name, mapping, job.queue);
     if (!group) continue;
 
     if (!groupMap.has(group)) groupMap.set(group, []);

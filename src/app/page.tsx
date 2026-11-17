@@ -168,19 +168,21 @@ function BuildsContent({ pipeline }: { pipeline: string }) {
     return [...groups].sort();
   }, [builds]);
 
-  const jobToGroup = useMemo(() => {
-    const map = new Map<string, string>();
+  const jobToGroups = useMemo(() => {
+    const map = new Map<string, Set<string>>();
     for (const option of groupData?.jobOptions ?? []) {
-      map.set(option.name, option.group);
+      const groups = map.get(option.name) ?? new Set<string>();
+      groups.add(option.group);
+      map.set(option.name, groups);
     }
     return map;
   }, [groupData?.jobOptions]);
 
   const availableJobNames = useMemo(() => {
     const groupFilter = selectedGroups.size > 0 ? selectedGroups : null;
-    return (groupData?.jobOptions ?? [])
+    return [...new Set((groupData?.jobOptions ?? [])
       .filter((option) => !groupFilter || groupFilter.has(option.group))
-      .map((option) => option.name);
+      .map((option) => option.name))];
   }, [groupData?.jobOptions, selectedGroups]);
 
   // "Now" for the headline numbers, refreshed each minute so a red stretch
@@ -353,8 +355,7 @@ function BuildsContent({ pipeline }: { pipeline: string }) {
               setPage(0);
               const groups = new Set(selectedGroups);
               for (const name of v) {
-                const group = jobToGroup.get(name);
-                if (group) groups.add(group);
+                for (const group of jobToGroups.get(name) ?? []) groups.add(group);
               }
               if (groups.size !== selectedGroups.size) setSelectedGroups(groups);
             }}

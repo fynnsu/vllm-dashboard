@@ -1,23 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import { queryClickHouse } from "@/lib/clickhouse";
 import { getCached, setCache } from "@/lib/api-cache";
 import { cachedJson } from "@/lib/api-response";
 import { ServerTiming } from "@/lib/server-timing";
 import {
-  aggregateJobsByGroup,
   isFailedJobState,
   type GroupStatus,
 } from "@/lib/test-groups";
 import {
   ensureOptionalJobMatcher,
   ensureSoftFailJobMatcher,
-  getTestAreaMappingForCommit,
   isOptionalJob,
   isSoftFailJob,
 } from "@/lib/test-areas";
 import { resolveCiDataSource } from "@/lib/ci-data-source";
-import { getBuildJobRosterRows } from "@/lib/buildkite-build-jobs";
-import { queryBuildJobsFromOtel } from "@/lib/otel-ci";
+import { getBuildGroupJobs, groupBuildJobs } from "@/lib/build-group-jobs";
 
 const TTL = 30_000;
 const CDN_CACHE = { maxAge: 60, staleWhileRevalidate: 3_600 };
@@ -62,110 +58,19 @@ export async function GET(request: NextRequest) {
       return cachedResponse;
     }
 
-    let jobs: Record<string, unknown>[];
-    if (resolveCiDataSource(request) === "otel") {
-      // OTel spans only cover jobs that ran; the gated jobs behind the manual
-      // unblock step never execute and produce no spans. The REST roster has
-      // the complete job list, so the group columns match the warehouse. Fall
-      // back to OTel spans if the roster comes back empty (e.g. API token
-      // misconfigured) so the table never loses every column.
-      jobs = await timing.measure("roster", getBuildJobRosterRows(buildIds));
-      if (jobs.length === 0) {
-        jobs = await timing.measure("spans", queryBuildJobsFromOtel(buildIds));
-      }
-    } else {
-      jobs = await timing.measure("warehouse", queryClickHouse(`
-        SELECT
-          j.build_id AS build_id,
-          j.name AS name,
-          j.state AS state,
-          j.web_url AS web_url,
-          j.started_at AS started_at,
-          b.commit AS commit_sha,
-          b.branch AS branch
-        FROM buildkite.build_job AS j FINAL
-        INNER JOIN (
-          SELECT id, commit, branch
-          FROM buildkite.build FINAL
-          WHERE id IN {buildIds:Array(String)} AND NOT _fivetran_deleted
-        ) AS b ON j.build_id = b.id
-        WHERE j.build_id IN {buildIds:Array(String)}
-          AND NOT j._fivetran_deleted
-          AND j.type = 'script'
-          AND j.name IS NOT NULL
-      `, { buildIds }));
-    }
-
-    const jobsByBuild = new Map<
-      string,
-      { name: string; state: string; web_url?: string }[]
-    >();
-    const startedJobCountsByBuild = Object.fromEntries(
-      buildIds.map((buildId) => [buildId, 0]),
-    ) as Record<string, number>;
-    const refsByBuild = new Map<
-      string,
-      { commit: string | null; branch: string | null }
-    >();
+    const jobs = await timing.measure("jobs", getBuildGroupJobs(buildIds, resolveCiDataSource(request)));
+    const grouped = await timing.measure("groups", groupBuildJobs(jobs, buildIds));
+    const startedJobCountsByBuild = Object.fromEntries(buildIds.map((id) => [id, 0]));
     for (const job of jobs) {
-      const row = job as Record<string, string | null>;
-      const buildId = row.build_id;
-      if (!buildId || !row.name || !row.state) continue;
-      if (!refsByBuild.has(buildId)) {
-        refsByBuild.set(buildId, {
-          commit: row.commit_sha,
-          branch: row.branch,
-        });
-      }
-      if (row.started_at) {
-        startedJobCountsByBuild[buildId] += 1;
-      }
-      const buildJobs = jobsByBuild.get(buildId) ?? [];
-      buildJobs.push({
-        name: row.name,
-        state: row.state,
-        web_url: row.web_url ?? undefined,
-      });
-      jobsByBuild.set(buildId, buildJobs);
+      if (typeof job.build_id === "string" && job.started_at) startedJobCountsByBuild[job.build_id]++;
     }
-
-    const groupedByBuild = new Map<string, GroupStatus[]>();
-    const jobToGroup = new Map<string, string>();
-    const mappingsByCommit = new Map<
-      string,
-      ReturnType<typeof getTestAreaMappingForCommit>
-    >();
-    for (const ref of refsByBuild.values()) {
-      const mappingKey = `${ref.branch ?? ""}:${ref.commit ?? ""}`;
-      if (!mappingsByCommit.has(mappingKey)) {
-        mappingsByCommit.set(
-          mappingKey,
-          getTestAreaMappingForCommit(ref.commit, ref.branch),
-        );
-      }
-    }
-    for (const buildId of buildIds) {
-      const ref = refsByBuild.get(buildId);
-      const mappingKey = `${ref?.branch ?? ""}:${ref?.commit ?? ""}`;
-      let mappingPromise = mappingsByCommit.get(mappingKey);
-      if (!mappingPromise) {
-        mappingPromise = getTestAreaMappingForCommit(
-          ref?.commit,
-          ref?.branch,
-        );
-        mappingsByCommit.set(mappingKey, mappingPromise);
-      }
-      const mapping = await mappingPromise;
-      const groups = aggregateJobsByGroup(
-        jobsByBuild.get(buildId) ?? [],
-        mapping,
-      );
-      groupedByBuild.set(buildId, groups);
+    const jobNamesSet = new Set<string>();
+    const jobOptions = new Map<string, { name: string; group: string }>();
+    for (const { groups } of grouped.values()) {
       for (const group of groups) {
         for (const job of group.jobs) {
-          if (!jobToGroup.has(job.name)) {
-            jobToGroup.set(job.name, group.group);
-          }
+          jobNamesSet.add(job.name);
+          jobOptions.set(JSON.stringify([job.name, group.group]), { name: job.name, group: group.group });
         }
       }
     }
@@ -173,7 +78,7 @@ export async function GET(request: NextRequest) {
     // Normalize repeated job names into one dictionary. The compact
     // name-index/state matrix is small enough to ship with group summaries, so
     // expanding a group is immediate. Only the much larger job URLs stay lazy.
-    const jobNames = [...jobToGroup.keys()].sort((a, b) => a.localeCompare(b));
+    const jobNames = [...jobNamesSet].sort((a, b) => a.localeCompare(b));
     const jobNameIndex = new Map(
       jobNames.map((name, index) => [name, index]),
     );
@@ -183,7 +88,7 @@ export async function GET(request: NextRequest) {
       Record<string, Array<[number, string] | [number, string, string[]]>>
     > = {};
     for (const buildId of buildIds) {
-      const groups = groupedByBuild.get(buildId) ?? [];
+      const groups = grouped.get(buildId)?.groups ?? [];
       compactJobsByBuild[buildId] = {};
       groupsByBuild[buildId] = groups.map(({ jobs: groupJobs, ...summary }) => {
         // A runtime-sharded step carries its shards' states, by index.
@@ -205,22 +110,36 @@ export async function GET(request: NextRequest) {
 
     // Flag jobs from the pipeline YAML's `optional` and `soft_fail` steps, as
     // indexes into jobNames, so the table's hide toggles track the YAML.
-    const [optionalMatcher, softFailMatcher] = await Promise.all([
+    const hasVllm = [...grouped.values()].some(({ mapping }) => mapping.vllmFallbacks !== false);
+    const [optionalMatcher, softFailMatcher] = hasVllm ? await Promise.all([
       ensureOptionalJobMatcher(),
       ensureSoftFailJobMatcher(),
-    ]);
-    const jobIndexesWhere = (matches: (name: string) => boolean) =>
-      jobNames.flatMap((name, index) => (matches(name) ? [index] : []));
+    ]) : [null, null];
+    const optionalNames = new Set<string>();
+    const softFailNames = new Set<string>();
+    for (const { mapping, jobs: buildJobs } of grouped.values()) {
+      for (const job of buildJobs) {
+        if (mapping.vllmFallbacks !== false && optionalMatcher && softFailMatcher) {
+          if (isOptionalJob(job.name, optionalMatcher)) optionalNames.add(job.name);
+          if (isSoftFailJob(job.name, softFailMatcher)) softFailNames.add(job.name);
+        } else {
+          const rules = mapping.patterns.filter((rule) => rule.regex.test(job.name) && (!rule.queue || rule.queue === job.queue));
+          if (rules.some((rule) => rule.optional)) optionalNames.add(job.name);
+          if (rules.some((rule) => rule.softFail)) softFailNames.add(job.name);
+        }
+      }
+    }
+    const jobIndexesWhere = (names: Set<string>) =>
+      jobNames.flatMap((name, index) => names.has(name) ? [index] : []);
 
     const result = {
       groupsByBuild,
       jobNames,
       jobsByBuild: compactJobsByBuild,
       startedJobCountsByBuild,
-      optionalJobs: jobIndexesWhere((name) => isOptionalJob(name, optionalMatcher)),
-      softFailJobs: jobIndexesWhere((name) => isSoftFailJob(name, softFailMatcher)),
-      jobOptions: [...jobToGroup.entries()]
-        .map(([name, group]) => ({ name, group }))
+      optionalJobs: jobIndexesWhere(optionalNames),
+      softFailJobs: jobIndexesWhere(softFailNames),
+      jobOptions: [...jobOptions.values()]
         .sort((a, b) => a.name.localeCompare(b.name)),
     };
     setCache(cacheKey, result, TTL);
